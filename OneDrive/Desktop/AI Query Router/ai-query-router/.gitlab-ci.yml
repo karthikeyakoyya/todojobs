@@ -1,0 +1,52 @@
+stages:
+  - build
+  - deploy
+
+variables:
+  AWS_DEFAULT_REGION: "ap-south-1"
+  ECR_URL: "857931483119.dkr.ecr.ap-south-1.amazonaws.com"
+
+build_image:
+  stage: build
+  image: docker:24.0.7
+  services:
+    - docker:24.0.7-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - apk add --no-cache aws-cli
+  script:
+    # Authenticate with AWS ECR
+    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_URL
+    # Build and push the fresh container
+    - docker build -t $ECR_URL/ai-query-router:latest .
+    - docker push $ECR_URL/ai-query-router:latest
+  only:
+    - main
+
+deploy_to_ec2:
+  stage: deploy
+  image: python:3.12-slim
+  before_script:
+    - mkdir -p ~/.ssh
+    # Safely unpack the SSH key variable from GitLab settings
+    - echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+  script:
+    # Log into EC2 and pull down the fresh image automatically
+    - |
+      ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa ubuntu@13.204.143.119 "
+        if ! command -v aws &> /dev/null; then
+          sudo apt-get update -y && sudo apt-get install -y unzip curl &&
+          curl 'https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip' -o 'awscliv2.zip' &&
+          unzip -q -o awscliv2.zip && sudo ./aws/install && rm -rf awscliv2.zip aws
+        fi &&
+        AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY aws ecr get-login-password --region ap-south-1 | sudo docker login --username AWS --password-stdin $ECR_URL &&
+        sudo docker pull $ECR_URL/ai-query-router:latest &&
+        sudo docker stop ai-query-router || true &&
+        sudo docker rm ai-query-router || true &&
+        sudo docker run -d --name ai-query-router --restart unless-stopped -p 8000:8000 -e GROQ_API_KEY='$GROQ_API_KEY' -e GEMINI_API_KEY='$GEMINI_API_KEY' $ECR_URL/ai-query-router:latest
+      "
+  only:
+    - main
